@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import threading
+import unicodedata
 
 from visdom.data_model.base import DataStore, read_json_file, UNREADABLE_JSON
 from visdom.server.defaults import LAYOUT_FILE, UNDO_DIRNAME
@@ -22,6 +23,24 @@ from visdom.utils.server_utils import escape_eid, LazyEnvData
 from visdom.utils.shared_utils import copy_json_data, ensure_dir_exists, NanSafeEncoder
 
 HASHED_ENV_RE = re.compile(r"^hash_[a-f0-9]{64}\.json$", re.IGNORECASE)
+
+
+def _held_by_another_case(path):
+    """Whether ``path`` only exists as a file named in a different case.
+
+    Windows and macOS ignore case by default, so asking there for
+    ``train.json`` also finds ``Train.json``, which belongs to another env.
+    The directory is only listed when the swapped-case name exists as well,
+    which on a case-sensitive filesystem it almost never does. HFS+ lists
+    names decomposed, so they are compared in NFC.
+    """
+    folder, name = os.path.split(path)
+    swapped = os.path.join(folder, name.swapcase())
+    if not (os.path.exists(path) and os.path.exists(swapped)):
+        return False
+    name = unicodedata.normalize("NFC", name)
+    return all(unicodedata.normalize("NFC", n) != name for n in os.listdir(folder))
+
 
 #: The small facts an env file holds outside its windows: the experiment
 #: metadata blob and, for a ``hash_<sha256>.json`` fallback, the real env id.
@@ -211,11 +230,16 @@ class JSONStore(DataStore):
         question, but only after the fact and only for a reader who knows it
         raises on mixed drives; the prefix form is the shape both static
         analysis and a reader recognise as "compared against env_path".
+
+        Also ``None`` when another env's file holds the name in a different
+        case, so this env falls back to :meth:`_hash_path`.
         """
         safe_eid = self._safe_eid(eid)
         base = os.path.abspath(self.env_path)
         path = os.path.abspath(os.path.join(base, "{0}.json".format(safe_eid)))
         if not path.startswith(os.path.join(base, "")):
+            return None
+        if _held_by_another_case(path):
             return None
         return path
 
@@ -329,6 +353,17 @@ class JSONStore(DataStore):
             self._atomic_write(
                 self._hash_path(eid), json.dumps(data_to_save, cls=NanSafeEncoder)
             )
+        else:
+            # The hash copy kept while another env held this name is out of
+            # date now. Left behind, it lists the env twice and outlives a
+            # delete.
+            stale = self._hash_path(eid)
+            if os.path.exists(stale):
+                try:
+                    os.remove(stale)
+                except OSError as e:
+                    logging.error(f"Failed to delete {stale}: {e}")
+                self._forget_meta(stale)
         return True
 
     def save_all(self, state):
@@ -652,13 +687,16 @@ class JSONStore(DataStore):
         """Return ``(undo_dir, plain_path, hashed_path)`` for ``eid``'s undo file.
 
         ``hashed_path`` mirrors ``serialize_env``'s fallback for env ids whose
-        plain filename would exceed the filesystem limit.
+        plain filename would exceed the filesystem limit, or is held by another
+        env's undo file in a different case.
         """
         safe_eid = self._safe_eid(eid)
         undo_dir = os.path.join(self.env_path, UNDO_DIRNAME)
         plain = os.path.join(undo_dir, "{0}.json".format(safe_eid))
         hashed_id = hashlib.sha256(safe_eid.encode("utf-8")).hexdigest()
         hashed = os.path.join(undo_dir, "hash_{0}.json".format(hashed_id))
+        if _held_by_another_case(plain):
+            plain = hashed
         return undo_dir, plain, hashed
 
     def load_undo(self, eid):

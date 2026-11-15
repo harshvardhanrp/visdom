@@ -532,6 +532,128 @@ def test_hash_shaped_file_missing_name_field_falls_back_to_its_stem(store, env_p
     assert store.list_envs() == sorted(["main", stem])
 
 
+# -- Case-insensitive filesystems ---------------------------------------------
+
+
+@pytest.fixture
+def case_insensitive(env_path, monkeypatch):
+    """Make ``env_path`` ignore case the way NTFS and APFS do.
+
+    Every path under it resolves to the entry already on disk whose name
+    matches ignoring case. ``os.path.exists`` and ``isfile`` go through
+    ``os.stat``, so patching that covers them. A directory that ignores case
+    already is left alone, and the tests run against the real thing.
+    """
+    probe = os.path.join(env_path, "probe")
+    open(probe, "w").close()
+    native = os.path.exists(os.path.join(env_path, "PROBE"))
+    os.remove(probe)
+    if native:
+        return
+
+    root = os.path.join(os.path.abspath(env_path), "")
+    real_stat, real_remove, real_replace = os.stat, os.remove, os.replace
+
+    def fold(path):
+        if not isinstance(path, (str, os.PathLike)):
+            return path
+        path = os.path.abspath(path)
+        if not isinstance(path, str) or not path.startswith(root):
+            return path
+        folded = root
+        for part in os.path.relpath(path, root).split(os.sep):
+            try:
+                entries = os.listdir(folded)
+            except OSError:
+                entries = []
+            match = [e for e in entries if e.lower() == part.lower()]
+            folded = os.path.join(folded, match[0] if match else part)
+        return folded
+
+    def folding_open(path, *args, **kwargs):
+        return open(fold(path), *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", lambda p, *a, **k: real_stat(fold(p), *a, **k))
+    monkeypatch.setattr(os, "remove", lambda p: real_remove(fold(p)))
+    monkeypatch.setattr(os, "replace", lambda s, d: real_replace(fold(s), fold(d)))
+    monkeypatch.setattr(json_store_module, "open", folding_open, raising=False)
+    monkeypatch.setattr(data_model_base, "open", folding_open, raising=False)
+    open(probe, "w").close()
+    assert os.path.exists(os.path.join(env_path, "PROBE"))
+    os.remove(probe)
+
+
+def test_case_differing_eids_do_not_collide(store, case_insensitive):
+    """'Train' and 'train' are two envs, so they keep a file each."""
+    store.save_env("Train", _env("first"))
+    store.save_env("train", _env("second"))
+
+    assert store.list_envs() == ["Train", "train"]
+    assert store.load_env("Train") == _env("first")
+    assert store.load_env("train") == _env("second")
+
+
+def test_deleting_one_case_variant_keeps_the_other(store, case_insensitive):
+    """Deleting either of 'Train' and 'train' leaves the other on disk."""
+    store.save_env("Train", _env("first"))
+    store.save_env("train", _env("second"))
+
+    assert store.delete_env("train")
+    assert store.list_envs() == ["Train"]
+    assert store.load_env("Train") == _env("first")
+
+    store.save_env("train", _env("second"))
+    assert store.delete_env("Train")
+    assert store.list_envs() == ["train"]
+    assert store.load_env("train") == _env("second")
+
+
+def test_case_variant_moves_to_its_own_file_once_free(store, case_insensitive):
+    """Once 'Train' is gone, 'train' is saved under its own name.
+
+    The hash fallback it used meanwhile must go with that save, or 'train' is
+    listed twice and its old data comes back after a delete.
+    """
+    store.save_env("Train", _env("first"))
+    store.save_env("train", _env("second"))
+    store.delete_env("Train")
+    assert store.load_env("train") == _env("second")
+
+    store.save_env("train", _env("third"))
+    assert store.list_envs() == ["train"]
+    assert store.load_env("train") == _env("third")
+    assert store.delete_env("train")
+    assert store.list_envs() == []
+
+
+def test_case_variants_keep_their_own_undo_stacks(store, case_insensitive):
+    """A pane closed in 'Train' is not restored by an undo in 'train'."""
+    store.save_undo("Train", [["a", {"id": "a"}]])
+    store.save_undo("train", [["b", {"id": "b"}]])
+
+    assert store.load_undo("Train") == [["a", {"id": "a"}]]
+    assert store.load_undo("train") == [["b", {"id": "b"}]]
+
+    store.clear_undo("train")
+    assert store.load_undo("train") == []
+    assert store.load_undo("Train") == [["a", {"id": "a"}]]
+
+
+def test_unsaved_case_variant_reads_nothing(store, case_insensitive):
+    """Reading 'TRAIN' does not hand back what 'Train' stored.
+
+    The server reads an env it does not hold from disk, so 'TRAIN' would take
+    over the windows of 'Train' and replace its file on the next save.
+    """
+    store.save_env("Train", _experiment_env("Train"))
+    store.save_undo("Train", [["a", {"id": "a"}]])
+
+    assert store.load_env("TRAIN") == {}
+    assert not store.env_exists("TRAIN")
+    assert store.load_experiment("TRAIN") is None
+    assert store.load_undo("TRAIN") == []
+
+
 # -- LazyEnvData -------------------------------------------------------------
 
 
